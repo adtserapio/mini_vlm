@@ -263,15 +263,6 @@ def prepare_dataset(config):
     )
     return train_dataloader, validation_dataloader, test_dataloader
 
-# Supported vision models:
-# - mistralai/Mistral-7B-Instruct-v0.3
-# - allenai/OLMo-1B-hf
-# - google/gemma-2b-it
-
-# Supported language models:
-# - openai/clip-vit-base-patch32
-# - google/siglip-base-patch16-224
-
 class Config:
     def __init__(self):
         self.tokenizer_name = "allenai/OLMo-1B-hf"
