@@ -25,7 +25,7 @@ class VLM(pl.LightningModule):
     def __init__(self, config):
         super(VLM, self).__init__()
         self.config = config
-        self.model_dtype = torch.float32
+        self.model_dtype = torch.bfloat16
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.tokenizer_name,
@@ -44,7 +44,7 @@ class VLM(pl.LightningModule):
         ).to(self.model_dtype)
         self.language_model.resize_token_embeddings(len(self.tokenizer))
         
-        if 'clip' in self.config.vision_model_name:
+        if 'clip' in self.config.vision_model_name or 'siglip' in self.config.vision_model_name:
             clip_model = AutoModel.from_pretrained(
                 self.config.vision_model_name,
                 torch_dtype=self.model_dtype
@@ -53,8 +53,9 @@ class VLM(pl.LightningModule):
         else:
             self.vision_model = AutoModel.from_pretrained(
                 self.config.vision_model_name,
-                self.model_dtype
+                torch_dtype=self.model_dtype
             )
+        self.config.num_img_patches = self.get_num_img_patches()
 
         for param in self.vision_model.parameters():
             param.requires_grad = False
@@ -74,7 +75,7 @@ class VLM(pl.LightningModule):
 
     def encode_images(self, pixel_values):
         device = self.language_model.device
-        pixel_values = pixel_values.to(device)
+        pixel_values = pixel_values.to(device).to(self.language_model.dtype)
         last_hidden_state = self.vision_model(pixel_values).last_hidden_state
         image_embeds = self.mm_projector(last_hidden_state)
         return image_embeds
@@ -124,6 +125,10 @@ class VLM(pl.LightningModule):
 
         return inputs_embeds, attention_mask, labels
 
+    def get_num_img_patches(self):
+        test_input = torch.randn(1, 3, 224, 224).to(self.model_dtype)
+        return self.vision_model(test_input).last_hidden_state.shape[1]
+    
     def compute_split_sizes_from_input_ids(self, input_ids, image_token_id):
         image_token_indices = (input_ids == image_token_id).nonzero(as_tuple=True)[0]
         if len(image_token_indices) == 0:
@@ -170,15 +175,11 @@ class VLM(pl.LightningModule):
     def on_validation_epoch_end(self):
         generated_texts = [result['generated_text'] for result in self.validation_results]
         original_texts = [result['original_text'] for result in self.validation_results]
-
         rouge_scores = self.rouge.compute(predictions=generated_texts, references=original_texts)
         rouge_l_score = rouge_scores['rougeL']
-
         self.log('val_rougeL', rouge_l_score)
-
         results_dir = f"results/validation/{self.config.dataset.replace('/', '_')}/{self.config.vision_model_name.replace('/', '_')}_{self.config.language_model_name.replace('/', '_')}"
         os.makedirs(results_dir, exist_ok=True)
-
         results_file = os.path.join(results_dir, f"epoch_{self.current_epoch}_rouge_{rouge_l_score:.4f}_validation_results.json")
 
         with open(results_file, 'w') as f:
@@ -223,29 +224,6 @@ class M3IT(Dataset):
             "ground_truth": data['outputs']
         }
     
-class MIMIC_CXR(Dataset):
-    def __init__(self, phase, data, config):
-        self.config = config
-        self.phase = phase
-        self.data = data
-        self.transform = v2.Compose([
-            v2.ToTensor(),
-            v2.Resize((224, 224)),
-            v2.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-        ])
-
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        row = self.data.iloc[idx]
-        pixel_values = self.transform(Image.open((row['Image Path'])).convert('RGB'))
-        return {
-            'id': str(uuid.uuid4()),
-            'pixel_values': pixel_values,
-            'text': preprocess(row['impression'])
-        }    
-    
 def prepare_dataset(config):
     if config.dataset == "m3it":
         dataset = load_dataset(
@@ -268,24 +246,6 @@ def prepare_dataset(config):
             dataset=dataset['test'].select(range(1000)),
             config=config
         )
-    elif config.dataset == "mimic_cxr":
-        data = pd.read_csv(config.data_csv_file)
-        data = data.dropna(subset=['impression'])
-        train_dataset = MIMIC_CXR(
-            phase='train', 
-            data=data[data['Split'] == 'train'][:10000].reset_index(drop=True),
-            config=config
-        )
-        validation_dataset = MIMIC_CXR(
-            phase='validation', 
-            data=data[data['Split'] == 'validation'].reset_index(drop=True),
-            config=config
-        )
-        test_dataset = MIMIC_CXR(
-            phase='test', 
-            data=data[data['Split'] == 'test'].reset_index(drop=True),
-            config=config
-        ) 
     train_dataloader = DataLoader(
         train_dataset, 
         batch_size=config.train_batch_size, 
@@ -303,12 +263,20 @@ def prepare_dataset(config):
     )
     return train_dataloader, validation_dataloader, test_dataloader
 
+# Supported vision models:
+# - mistralai/Mistral-7B-Instruct-v0.3
+# - allenai/OLMo-1B-hf
+# - google/gemma-2b-it
+
+# Supported language models:
+# - openai/clip-vit-base-patch32
+# - google/siglip-base-patch16-224
+
 class Config:
     def __init__(self):
-        self.tokenizer_name = "mistralai/Mistral-7B-Instruct-v0.3"
-        self.language_model_name = "mistralai/Mistral-7B-Instruct-v0.3"
-        self.vision_model_name = "openai/clip-vit-base-patch32"
-        self.num_img_patches = 50
+        self.tokenizer_name = "allenai/OLMo-1B-hf"
+        self.language_model_name = "allenai/OLMo-1B-hf"
+        self.vision_model_name = "google/siglip-base-patch16-224"
         self.token = os.getenv("HUGGINGFACE_TOKEN")
         self.max_new_tokens = 50
         self.dataset = "m3it"
@@ -334,4 +302,3 @@ trainer = pl.Trainer(
 
 trainer.fit(model, train_dataloader, validation_dataloader)
 trainer.test(model, test_dataloader)
-
